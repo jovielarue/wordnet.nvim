@@ -4,7 +4,7 @@ function wordnet.setup(opts)
   wordnet.config = opts or {}
 end
 
----Runs a single sqlite3 query and return lines of output.
+---Runs a single sqlite3 query and returns a string array of lines of output.
 ---@param sql string
 ---@return string[]
 local function sqlite_query(sql)
@@ -29,16 +29,46 @@ local function sqlite_query(sql)
   return lines
 end
 
----Fetch synonyms for a word.
----Returns a list of { synonym, definition } tables.
+---Fetch definitions for a word.
+---Returns a string array of definitions.
 ---@param word string
----@return table[]
+---@return string[]
+local function fetch_definition(word)
+  word = word:lower():gsub("'", "''") -- SQL escape
+
+  -- Query modified from https://github.com/x-englishwordnet/sqlite/blob/master/oewn-queries.pdf
+  local sql = string.format([[
+    SELECT definition
+    FROM words AS sw
+    LEFT JOIN senses AS s USING (wordid)
+    LEFT JOIN synsets AS y USING (synsetid)
+    WHERE sw.word = '%s'
+    GROUP BY y.synsetid;
+  ]], word)
+
+  local lines = sqlite_query(sql)
+  local results = {}
+
+  for _, line in ipairs(lines) do
+    local definition = line
+
+    if definition and definition ~= "" then
+      table.insert(results, definition)
+    end
+  end
+  return results
+end
+
+---Fetch synonyms for a word.
+---Returns a string array of synonyms.
+---@param word string
+---@return string[]
 local function fetch_synonyms(word)
   word = word:lower():gsub("'", "''") -- SQL escape
 
   -- Query modified from https://github.com/x-englishwordnet/sqlite/blob/master/oewn-queries.pdf
   local sql = string.format([[
-    SELECT GROUP_CONCAT(sw2.word), definition
+    SELECT GROUP_CONCAT(sw2.word)
     FROM words AS sw
     LEFT JOIN senses AS s USING (wordid)
     LEFT JOIN synsets AS y USING (synsetid)
@@ -52,109 +82,47 @@ local function fetch_synonyms(word)
   local results = {}
 
   for _, line in ipairs(lines) do
-    local synonym, definition = line:match("([^|]+)|(.*)")
+    local synonym = line:gsub(",", ", ")
 
-    if synonym and synonym ~= "" and definition and definition ~= "" then
-      table.insert(results, {
-        synonym = synonym:gsub(",", ", "),
-        definition = definition,
-      })
+    if synonym and synonym ~= "" then
+      table.insert(results, synonym)
     end
   end
   return results
 end
 
----Set up and open up the Telescope picker for a specific word
+---Open a type of vim.ui.select picker for a word.
+---Type must be "synonym" or "definition"
 ---@param word string
-local function make_picker(word)
-  local pickers = require("telescope.pickers")
-  local finders = require("telescope.finders")
-  local conf = require("telescope.config").values
-  local actions = require("telescope.actions")
-  local action_state = require("telescope.actions.state")
-  local entry_display = require("telescope.pickers.entry_display")
+---@param type string
+local function show_entries_for(word, type)
+  local entrylist = {}
+  if type == "synonym" then
+    entrylist = fetch_synonyms(word)
+  else
+    entrylist = fetch_definition(word)
+  end
 
-  local synonyms = fetch_synonyms(word)
-
-  if vim.tbl_isempty(synonyms) then
+  if vim.tbl_isempty(entrylist) then
     vim.notify(
-      string.format("[wordnet] No synonyms found for '%s'", word),
+      string.format("[wordnet] No %ss found for '%s'", type, word),
       vim.log.levels.WARN
     )
     return
   end
-
-  -- Make space for the longest list of synonyms in the displayer
-  local longest_synonym = 0
-  for _, entry in ipairs(synonyms) do
-    if entry then
-      local length = string.len(entry.synonym)
-      if length > longest_synonym then
-        longest_synonym = length + 2
-      end
-    end
-  end
-
-  local displayer = entry_display.create({
-    separator = " ",
-    items = {
-      { width = longest_synonym },       -- synonym
-      { remaining = true }, -- definition
-    }
-  })
-
-  local function make_display(entry)
-    return displayer({
-      { entry.value.synonym,    "TelescopeResultsIdentifier" },
-      { entry.value.definition, "TelescopeResultsComment" },
-    })
-  end
-
-  pickers.new({}, {
-    prompt_title = string.format("Synonyms for %s", word),
-
-    finder = finders.new_table({
-      results = synonyms,
-      entry_maker = function(item)
-        return {
-          value = item,
-          display = make_display,
-          ordinal = item.synonym .. " " .. item.definition,
-        }
-      end,
-    }),
-
-    sorter = conf.generic_sorter({}),
-
-    attach_mappings = function(prompt_bufnr, map)
-      -- <CR> - insert the synonym at cursor position
-      actions.select_default:replace(function()
-        actions.close(prompt_bufnr)
-        local selection = action_state.get_selected_entry()
-        if selection then
-          vim.api.nvim_put({ selection.value.synonym }, "c", true, true)
-        end
-      end)
-
-      -- <C-y> - yank synonym to the unnamed register without inserting
-      map("i", "<C-y>", function()
-        local selection = action_state.get_selected_entry()
-        if selection then
-          vim.fn.setreg('"', selection.value.synonym)
-          vim.notify(
-            string.format("[wordnet] Yanked '%s'", selection.value.synonym),
-            vim.log.levels.INFO
-          )
-        end
-      end)
-
-      return true
-    end,
-  }):find()
+  vim.ui.select(entrylist, {
+    prompt = string.format("%ss for '%s'", type:gsub("^%l", string.upper), word),
+    format_item = function(item) return item end,
+  }, function(selection)
+    if not selection then return end
+    vim.api.nvim_put({ selection }, "c", true, true)
+  end)
 end
 
----Open a prompt asking for a word, then open the synonym Telescope picker.
-function wordnet.pick()
+---Open a prompt asking for a word, then open the vim.ui.select for the specified type
+---Type must be "synonym" or "definition"
+---@param type string
+function wordnet.pick(type)
   -- Verify db exists
   if vim.fn.filereadable(vim.fn.expand(wordnet.config.db_path)) == 0 then
     vim.notify(
@@ -164,7 +132,17 @@ function wordnet.pick()
       ),
       vim.log.levels.ERROR
     )
+    return
+  end
 
+  if type ~= "synonym" and type ~= "definition" then
+    vim.notify(
+      string.format(
+        "Picker type %s is not valid. Please define the type as 'synonym' or 'definition' in your config.",
+        type
+      ),
+      vim.log.levels.ERROR
+    )
     return
   end
 
@@ -173,7 +151,7 @@ function wordnet.pick()
     if not input or input == "" then return end
 
     vim.schedule(function()
-      make_picker(vim.trim(input))
+      show_entries_for(vim.trim(input), type)
     end)
   end)
 end
