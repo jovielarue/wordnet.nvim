@@ -38,7 +38,7 @@ local function fetch_synonyms(word)
 
   -- Query modified from https://github.com/x-englishwordnet/sqlite/blob/master/oewn-queries.pdf
   local sql = string.format([[
-    SELECT sw2.word, definition
+    SELECT GROUP_CONCAT(sw2.word), definition
     FROM words AS sw
     LEFT JOIN senses AS s USING (wordid)
     LEFT JOIN synsets AS y USING (synsetid)
@@ -56,7 +56,7 @@ local function fetch_synonyms(word)
 
     if synonym and synonym ~= "" and definition and definition ~= "" then
       table.insert(results, {
-        synonym = synonym,
+        synonym = synonym:gsub(",", ", "),
         definition = definition,
       })
     end
@@ -84,10 +84,21 @@ local function make_picker(word)
     return
   end
 
+  -- Make space for the longest list of synonyms in the displayer
+  local longest_synonym = 0
+  for _, entry in ipairs(synonyms) do
+    if entry then
+      local length = string.len(entry.synonym)
+      if length > longest_synonym then
+        longest_synonym = length + 2
+      end
+    end
+  end
+
   local displayer = entry_display.create({
     separator = " ",
     items = {
-      { width = 24 },       -- synonym
+      { width = longest_synonym },       -- synonym
       { remaining = true }, -- definition
     }
   })
